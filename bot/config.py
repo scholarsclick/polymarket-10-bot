@@ -50,12 +50,20 @@ class Settings:
     entry_price_min: float = 0.30
     entry_price_max: float = 0.70
 
+    # --- Market universe filter ------------------------------------------
+    #: Restrict trading to short-duration crypto up/down markets only.
+    restrict_to_crypto_shortterm: bool = True
+    #: Which underlying assets to trade.
+    assets: tuple[str, ...] = ("BTC", "ETH")
+    #: Which market durations to trade.
+    timeframes: tuple[str, ...] = ("5m", "15m")
+
     # --- Data feed --------------------------------------------------------
     #: Hosts must be reachable (allowlisted) for live data. If unreachable
     #: the engine automatically falls back to the simulated feed.
     gamma_api_url: str = "https://gamma-api.polymarket.com"
     clob_api_url: str = "https://clob.polymarket.com"
-    market_scan_limit: int = 25
+    market_scan_limit: int = 200
 
     # Internal: tags used in exit reasons / dashboards
     base_currency: str = "USDC"

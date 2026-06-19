@@ -72,6 +72,20 @@ def sidebar() -> Settings:
         help="Close the position when the token price falls this % below entry.",
     )
 
+    st.sidebar.subheader("Markets")
+    restrict = st.sidebar.checkbox(
+        "Only BTC/ETH short-duration markets", value=settings.restrict_to_crypto_shortterm,
+        help="Restrict trading to crypto up/down markets for the selected assets and timeframes.",
+    )
+    assets = st.sidebar.multiselect(
+        "Assets", options=["BTC", "ETH", "SOL", "XRP"],
+        default=list(settings.assets), disabled=not restrict,
+    )
+    timeframes = st.sidebar.multiselect(
+        "Timeframes", options=["5m", "15m", "1h", "1d"],
+        default=list(settings.timeframes), disabled=not restrict,
+    )
+
     st.sidebar.subheader("Entry Strategy")
     max_pos = st.sidebar.number_input(
         "Max Open Positions", min_value=1, max_value=50,
@@ -116,6 +130,9 @@ def sidebar() -> Settings:
         order_size_usdc=size,
         entry_price_min=band[0],
         entry_price_max=band[1],
+        restrict_to_crypto_shortterm=restrict,
+        assets=tuple(assets) or ("BTC", "ETH"),
+        timeframes=tuple(timeframes) or ("5m", "15m"),
     )
 
     mode_changed = new_settings.mode != settings.mode

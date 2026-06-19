@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from .config import Settings, TradingMode
-from .market_data import MarketQuote, build_provider
+from .market_data import MarketQuote, build_provider, matches_universe
 from .models import ClosedTrade, Position
 
 
@@ -95,6 +95,10 @@ class TradingEngine:
             if len(self.positions) >= self.settings.max_open_positions:
                 break
             if q.token_id in self.positions:
+                continue
+            if self.settings.restrict_to_crypto_shortterm and not matches_universe(
+                q.search_text, self.settings.assets, self.settings.timeframes
+            ):
                 continue
             if not (self.settings.entry_price_min <= q.price <= self.settings.entry_price_max):
                 continue

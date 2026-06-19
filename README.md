@@ -8,6 +8,14 @@ By default it runs in **Live Data Paper Trading** mode: it reads real
 Polymarket prices but simulates fills locally. **No real orders are ever
 placed** unless you explicitly switch to Live mode *and* enable real orders.
 
+## Market universe
+
+By default the bot only trades **BTC and ETH short-duration up/down markets**
+on the **5-minute and 15-minute** timeframes. Assets and timeframes are
+configurable from the dashboard sidebar (or `--assets` / `--timeframes` on the
+CLI), and the filter can be turned off to trade any market. Matching is done on
+the market question and slug (e.g. `Bitcoin Up or Down — 5 minute`).
+
 ## Features
 
 - **Take-profit on token price gain** — `take_profit_price = entry_price × 1.10`
@@ -32,8 +40,14 @@ pip install -r requirements.txt
 # Dashboard
 streamlit run app.py
 
-# Or headless paper loop
+# Or headless paper loop (BTC/ETH 5m & 15m by default)
 python run_bot.py --ticks 50 --interval 1
+
+# Trade only BTC on 5-minute markets
+python run_bot.py --assets BTC --timeframes 5m
+
+# Trade any market (disable the crypto filter)
+python run_bot.py --all-markets
 ```
 
 ## Live data

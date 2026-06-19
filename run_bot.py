@@ -23,18 +23,38 @@ def main() -> None:
     parser.add_argument("--take-profit", type=float, default=10.0)
     parser.add_argument("--stop-loss", type=float, default=10.0)
     parser.add_argument("--no-stop-loss", action="store_true")
+    parser.add_argument(
+        "--assets", default="BTC,ETH",
+        help="comma-separated assets to trade (e.g. BTC,ETH)",
+    )
+    parser.add_argument(
+        "--timeframes", default="5m,15m",
+        help="comma-separated market durations (e.g. 5m,15m)",
+    )
+    parser.add_argument(
+        "--all-markets", action="store_true",
+        help="disable the BTC/ETH short-duration filter and trade any market",
+    )
     args = parser.parse_args()
 
     settings = Settings(
         take_profit_pct=args.take_profit,
         stop_loss_pct=args.stop_loss,
         stop_loss_enabled=not args.no_stop_loss,
+        restrict_to_crypto_shortterm=not args.all_markets,
+        assets=tuple(a.strip().upper() for a in args.assets.split(",") if a.strip()),
+        timeframes=tuple(t.strip().lower() for t in args.timeframes.split(",") if t.strip()),
     )
     engine = TradingEngine(settings)
     print(f"[feed] {engine.feed_message}")
+    universe = (
+        f"{','.join(settings.assets)} @ {','.join(settings.timeframes)}"
+        if settings.restrict_to_crypto_shortterm else "all markets"
+    )
     print(
         f"[config] TP={settings.take_profit_pct}% SL="
         f"{settings.stop_loss_pct if settings.stop_loss_enabled else 'off'}% "
+        f"universe=[{universe}] "
         f"mode={settings.mode.value} real_orders={settings.real_orders_active}"
     )
 

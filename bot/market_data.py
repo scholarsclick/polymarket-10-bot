@@ -10,9 +10,45 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from dataclasses import dataclass, field
 
 import requests
+
+
+# Keyword/pattern maps used to keep only BTC/ETH short-duration up/down markets.
+ASSET_KEYWORDS = {
+    "BTC": (r"\bbtc\b", r"\bbitcoin\b", r"\bxbt\b"),
+    "ETH": (r"\beth\b", r"\bethereum\b", r"\bether\b"),
+    "SOL": (r"\bsol\b", r"\bsolana\b"),
+    "XRP": (r"\bxrp\b", r"\bripple\b"),
+}
+
+# \b before the leading digit prevents "15 min" from matching the 5m pattern.
+TIMEFRAME_PATTERNS = {
+    "5m": (r"\b5\s*-?\s*m(?:in(?:ute)?s?)?\b",),
+    "15m": (r"\b15\s*-?\s*m(?:in(?:ute)?s?)?\b",),
+    "1h": (r"\b1\s*-?\s*h(?:our|r)?s?\b", r"\b60\s*-?\s*m(?:in(?:ute)?s?)?\b"),
+    "1d": (r"\b1\s*-?\s*d(?:ay)?s?\b", r"\bdaily\b"),
+}
+
+
+def matches_universe(text: str, assets, timeframes) -> bool:
+    """True if ``text`` (question/slug) names one of the assets AND timeframes."""
+    blob = (text or "").lower()
+    asset_ok = any(
+        re.search(p, blob)
+        for a in assets
+        for p in ASSET_KEYWORDS.get(a.upper(), ())
+    )
+    if not asset_ok:
+        return False
+    tf_ok = any(
+        re.search(p, blob)
+        for t in timeframes
+        for p in TIMEFRAME_PATTERNS.get(t.lower(), ())
+    )
+    return tf_ok
 
 
 @dataclass
@@ -24,6 +60,12 @@ class MarketQuote:
     question: str
     outcome: str
     price: float
+    slug: str = ""
+
+    @property
+    def search_text(self) -> str:
+        """Combined text used for asset/timeframe matching."""
+        return f"{self.question} {self.slug}"
 
 
 class MarketDataError(RuntimeError):
@@ -76,6 +118,7 @@ class LivePolymarketProvider:
                         question=str(m.get("question", "")),
                         outcome=str(outcomes[0]),
                         price=price,
+                        slug=str(m.get("slug", "")),
                     )
                 )
             except (ValueError, IndexError, TypeError):
@@ -115,18 +158,19 @@ class SimulatedProvider:
         return "Simulated (offline)"
 
     def _build_catalog(self) -> list[MarketQuote]:
+        # Mirrors Polymarket's short-duration crypto up/down markets.
         seeds = [
-            ("Will BTC close above $100k this month?", "Yes", 0.52),
-            ("Will the Fed cut rates at the next meeting?", "Yes", 0.45),
-            ("Will Team A win the championship?", "Yes", 0.61),
-            ("Will it rain in NYC on election day?", "Yes", 0.38),
-            ("Will ETH flip $5k before year end?", "Yes", 0.43),
-            ("Will the incumbent win re-election?", "Yes", 0.55),
-            ("Will the new film gross >$1B?", "Yes", 0.49),
-            ("Will SpaceX launch succeed this week?", "Yes", 0.66),
+            ("Bitcoin Up or Down — 5 minute", "bitcoin-up-or-down-5m", "Up", 0.51),
+            ("Bitcoin Up or Down — 15 minute", "bitcoin-up-or-down-15m", "Up", 0.48),
+            ("Ethereum Up or Down — 5 minute", "ethereum-up-or-down-5m", "Up", 0.53),
+            ("Ethereum Up or Down — 15 minute", "ethereum-up-or-down-15m", "Up", 0.46),
+            ("Bitcoin Up or Down — 5 minute (next)", "bitcoin-up-or-down-5m-2", "Up", 0.55),
+            ("Ethereum Up or Down — 15 minute (next)", "ethereum-up-or-down-15m-2", "Up", 0.44),
+            ("Bitcoin Up or Down — 15 minute (next)", "bitcoin-up-or-down-15m-2", "Up", 0.49),
+            ("Ethereum Up or Down — 5 minute (next)", "ethereum-up-or-down-5m-2", "Up", 0.5),
         ]
         catalog = []
-        for i, (q, outcome, p) in enumerate(seeds):
+        for i, (q, slug, outcome, p) in enumerate(seeds):
             tid = f"sim-token-{i}"
             self._prices[tid] = p
             catalog.append(
@@ -136,6 +180,7 @@ class SimulatedProvider:
                     question=q,
                     outcome=outcome,
                     price=p,
+                    slug=slug,
                 )
             )
         return catalog
@@ -144,7 +189,10 @@ class SimulatedProvider:
         out = []
         for q in self._catalog[:limit]:
             out.append(
-                MarketQuote(q.market_id, q.token_id, q.question, q.outcome, self._prices[q.token_id])
+                MarketQuote(
+                    q.market_id, q.token_id, q.question, q.outcome,
+                    self._prices[q.token_id], slug=q.slug,
+                )
             )
         return out
 
