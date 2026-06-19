@@ -197,15 +197,17 @@ class LivePolymarketProvider:
                 quote = self._parse_market(m)
                 if quote is not None:
                     quotes.append(quote)
-                    if len(raw) < 40:
-                        raw.append({
-                            "title": quote.question[:60],
-                            "asset": quote.asset or "?",
-                            "tf": quote.timeframe or "?",
-                            "dur_min": round(quote.duration_min, 1) if quote.duration_min else None,
-                        })
+                    raw.append((m, quote))
             offset += page
-        self.last_raw = raw
+
+        # Build a diagnostic sample, prioritising crypto-looking markets so the
+        # debug panel reveals exactly how real BTC/ETH markets are classified.
+        def _is_crypto(pair):
+            blob = (pair[1].question + " " + pair[1].slug).lower()
+            return any(h in blob for h in ("bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp"))
+
+        raw.sort(key=lambda pair: not _is_crypto(pair))  # crypto first
+        self.last_raw = [_diag_row(m, q) for m, q in raw[:30]]
         if not quotes:
             raise MarketDataError("Gamma API returned no tradable markets.")
         return quotes
@@ -223,10 +225,8 @@ class LivePolymarketProvider:
                     up_idx = i
                     break
             down_idx = 1 - up_idx if len(outcomes) == 2 else (up_idx + 1) % len(outcomes)
-            start = _parse_dt(m.get("startDate") or m.get("start_date_iso")
-                              or m.get("acceptingOrdersTimestamp"))
             end = _parse_dt(m.get("endDate") or m.get("end_date_iso"))
-            duration = (end - start).total_seconds() / 60.0 if (start and end) else None
+            duration = _window_minutes(m, end)
             return MarketQuote(
                 market_id=str(m.get("id")),
                 token_id=str(token_ids[up_idx]),
@@ -358,6 +358,21 @@ class SimulatedProvider:
         return round(nxt, 4)
 
 
+def _diag_row(m: dict, quote: "MarketQuote") -> dict:
+    """A compact, copyable diagnostic row for one market."""
+    dates = {k: m.get(k) for k in
+             ("startDate", "endDate", "gameStartTime", "acceptingOrdersTimestamp")
+             if m.get(k)}
+    return {
+        "title": quote.question[:70],
+        "slug": quote.slug[:50],
+        "asset": quote.asset or "?",
+        "tf": quote.timeframe or "?",
+        "dur_min": quote.duration_min,
+        "dates": dates,
+    }
+
+
 def _maybe_json(value):
     """Gamma returns some array fields as JSON-encoded strings."""
     if value is None:
@@ -379,6 +394,36 @@ def _parse_dt(value) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
+
+
+# Candidate "window start" fields, in order of how likely they mark the actual
+# trading window (not the listing date).
+_START_FIELDS = (
+    "gameStartTime", "eventStartTime", "startTime", "acceptingOrdersTimestamp",
+    "startDate", "start_date_iso",
+)
+
+
+def _window_minutes(m: dict, end: datetime | None) -> float | None:
+    """Best estimate of a market's window length, in minutes.
+
+    Polymarket's ``startDate`` is often the *listing* date (days before
+    resolution), which would massively overstate the window for a 5/15-minute
+    market. We therefore take the **smallest positive** duration across all
+    available start fields, which picks the true short window when a
+    ``gameStartTime``-style field is present.
+    """
+    if end is None:
+        return None
+    candidates = []
+    for field_name in _START_FIELDS:
+        start = _parse_dt(m.get(field_name))
+        if start is None:
+            continue
+        minutes = (end - start).total_seconds() / 60.0
+        if minutes > 0:
+            candidates.append(minutes)
+    return round(min(candidates), 4) if candidates else None
 
 
 def build_provider(settings, force_simulated: bool = False):

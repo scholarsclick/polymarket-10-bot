@@ -262,9 +262,10 @@ def render_debug():
             "opportunities": len(r.opportunities),
             "skipped": len(r.skipped),
         })
-        st.markdown("**Raw markets returned (detected asset / timeframe)**")
+        st.markdown("**Raw markets returned (crypto first) — copyable**")
+        st.caption("If 'accepted' is 0, paste this block so detection can be tuned.")
         if r.raw_sample:
-            st.dataframe(pd.DataFrame(r.raw_sample), use_container_width=True, hide_index=True, height=220)
+            st.json(r.raw_sample, expanded=False)
         else:
             st.write("_No raw markets captured._")
     with c[1]:
