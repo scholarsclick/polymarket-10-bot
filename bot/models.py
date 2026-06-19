@@ -35,6 +35,8 @@ class Position:
     size: float  # number of outcome shares held
     entry_time: datetime = field(default_factory=_now)
     expiry: datetime | None = None
+    asset: str = ""
+    timeframe: str = ""
 
     take_profit_price: float = 0.0
     stop_loss_price: float = 0.0
@@ -118,6 +120,8 @@ class ClosedTrade:
     close_price: float
     size: float
     exit_reason: str
+    asset: str = ""
+    timeframe: str = ""
 
     @property
     def profit_pct(self) -> float:

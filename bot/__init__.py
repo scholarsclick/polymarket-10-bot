@@ -2,6 +2,7 @@
 
 from .config import Settings, TradingMode
 from .engine import ScanReport, TickResult, TradingEngine
+from .learning import LearningModel
 from .models import ClosedTrade, Position
 from .performance import compute_performance, daily_stats
 from .price_feed import SpotPriceFeed
@@ -17,6 +18,7 @@ __all__ = [
     "ClosedTrade",
     "Opportunity",
     "SpotPriceFeed",
+    "LearningModel",
     "compute_performance",
     "daily_stats",
 ]

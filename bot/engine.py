@@ -9,17 +9,24 @@ Key behaviours required by the spec:
 * The engine NEVER places real orders unless ``settings.real_orders_active``
   (mode == LIVE *and* live_trading_enabled). Default mode is Live Data Paper
   Trading, so fills are simulated locally.
-* Every tick records a ScanReport (markets returned/accepted, opportunities,
-  and skipped markets with reasons) for the dashboard's debug panel.
+* An adaptive ``LearningModel`` records every closed trade's outcome and feeds
+  a learned win rate back into the scanner.
+* Work is split so the dashboard can refresh prices/PnL fast while scanning for
+  new markets on a slower cadence:
+    - ``refresh_prices()`` → spot feed, marks, TP/SL exits  (fast loop)
+    - ``scan()``           → discover markets + open trades  (slow loop)
+    - ``tick()``           → both (headless/back-compat)
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from .config import Settings, TradingMode
-from .market_data import MarketQuote, build_provider, matches_universe
+from .learning import LearningModel
+from .market_data import MarketQuote, build_provider
 from .models import ClosedTrade, Position
 from .price_feed import SpotPriceFeed
 from . import scanner
@@ -34,6 +41,7 @@ class ScanReport:
     markets_accepted: int = 0
     opportunities: list = field(default_factory=list)  # list[Opportunity]
     skipped: list = field(default_factory=list)  # list[(title, reason)]
+    raw_sample: list = field(default_factory=list)  # list[dict] of raw markets
 
     @property
     def time_str(self) -> str:
@@ -48,7 +56,7 @@ class TickResult:
 
 
 class TradingEngine:
-    def __init__(self, settings: Settings, provider=None, spot_feed=None):
+    def __init__(self, settings: Settings, provider=None, spot_feed=None, learner=None):
         self.settings = settings
         self.positions: dict[str, Position] = {}  # token_id -> Position
         self.closed_trades: list[ClosedTrade] = []
@@ -56,6 +64,7 @@ class TradingEngine:
         self.feed_message: str = ""
         self.using_fallback: bool = False
         self.last_report: ScanReport = ScanReport()
+        self.equity_curve: list[float] = []  # cumulative realized PnL over time
 
         if provider is None:
             provider, fallback, msg = build_provider(settings)
@@ -64,6 +73,17 @@ class TradingEngine:
         self.provider = provider
 
         self.spot_feed = spot_feed or SpotPriceFeed(assets=settings.assets)
+
+        if learner is None and settings.learning_enabled:
+            path = os.path.join(settings.state_dir, "learning.json")
+            learner = LearningModel(
+                path=path,
+                prior_alpha=settings.learn_prior_alpha,
+                prior_beta=settings.learn_prior_beta,
+                min_samples=settings.learn_min_samples,
+                winrate_floor=settings.learn_winrate_floor,
+            )
+        self.learner = learner
 
     # ------------------------------------------------------------------ #
     # Entries
@@ -80,33 +100,36 @@ class TradingEngine:
             entry_price=entry,
             size=size,
             expiry=quote.expiry,
+            asset=quote.asset,
+            timeframe=quote.timeframe,
             take_profit_price=self.settings.take_profit_price(entry),
             stop_loss_price=self.settings.stop_loss_price(entry),
             stop_loss_enabled=self.settings.stop_loss_enabled,
             mark_price=entry,
         )
 
-    def _scan_and_enter(self) -> tuple[list[Position], ScanReport]:
+    def scan(self) -> tuple[list[Position], ScanReport]:
+        """Discover markets, evaluate signals, and open new trades."""
         report = ScanReport()
         opened: list[Position] = []
         try:
             quotes = self.provider.list_markets(self.settings.market_scan_limit)
         except Exception:
+            report.raw_sample = getattr(self.provider, "last_raw", [])
             self.last_report = report
             return opened, report
         report.markets_returned = len(quotes)
+        report.raw_sample = getattr(self.provider, "last_raw", [])
 
         held = set(self.positions.keys())
         for q in quotes:
-            # Universe filter (asset + timeframe).
-            if self.settings.restrict_to_crypto_shortterm and not matches_universe(
-                q.search_text, self.settings.assets, self.settings.timeframes
+            if self.settings.restrict_to_crypto_shortterm and not q.in_universe(
+                self.settings.assets, self.settings.timeframes
             ):
-                report.skipped.append((q.question, "outside BTC/ETH 5m·15m universe"))
-                continue
+                continue  # silent: too many off-universe markets to list
             report.markets_accepted += 1
 
-            opp = scanner.evaluate(q, self.spot_feed, self.settings, held)
+            opp = scanner.evaluate(q, self.spot_feed, self.settings, held, self.learner)
             report.opportunities.append(opp)
 
             if not opp.will_trade:
@@ -172,10 +195,21 @@ class TradingEngine:
             close_price=pos.mark_price,
             size=pos.size,
             exit_reason=reason,
+            asset=pos.asset,
+            timeframe=pos.timeframe,
         )
         self.realized_pnl += trade.realized_pnl
         self.closed_trades.append(trade)
+        self.equity_curve.append(round(self.realized_pnl, 4))
         del self.positions[token_id]
+
+        # Learn from the outcome and persist.
+        if self.learner is not None:
+            self.learner.record_trade(trade)
+            try:
+                self.learner.save()
+            except OSError:
+                pass
         return trade
 
     def close_all(self, reason: str = "MANUAL_CLOSE") -> list[ClosedTrade]:
@@ -193,13 +227,20 @@ class TradingEngine:
         )
 
     # ------------------------------------------------------------------ #
-    def tick(self, allow_entries: bool = True) -> TickResult:
+    # Public loops
+    # ------------------------------------------------------------------ #
+    def refresh_prices(self) -> list[ClosedTrade]:
+        """Fast loop: refresh spot + marks, then run TP/SL exits."""
         self.spot_feed.refresh()
         self._update_marks()
-        closed = self._check_exits()
+        return self._check_exits()
+
+    def tick(self, allow_entries: bool = True) -> TickResult:
+        """Run both loops once (headless / tests / back-compat)."""
+        closed = self.refresh_prices()
         opened, report = ([], self.last_report)
         if allow_entries:
-            opened, report = self._scan_and_enter()
+            opened, report = self.scan()
         self._update_marks()
         return TickResult(opened=opened, closed=closed, report=report)
 

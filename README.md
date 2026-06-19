@@ -13,8 +13,36 @@ placed** unless you explicitly switch to Live mode *and* enable real orders.
 By default the bot only trades **BTC and ETH short-duration up/down markets**
 on the **5-minute and 15-minute** timeframes. Assets and timeframes are
 configurable from the dashboard sidebar (or `--assets` / `--timeframes` on the
-CLI), and the filter can be turned off to trade any market. Matching is done on
-the market question and slug (e.g. `Bitcoin Up or Down — 5 minute`).
+CLI), and the filter can be turned off to trade any market.
+
+**Timeframe detection is duration-based**: the bot computes each market's window
+(`endDate − startDate`) and maps it to the nearest bucket (5m / 15m / 1h / 1d),
+falling back to text matching on the title/slug. This is far more reliable than
+parsing titles, which don't always spell out the interval.
+
+### Diagnosing "no markets found"
+
+If the scanner shows no markets, the **Debug Panel** lists the raw markets the
+API returned with their detected asset/timeframe. You can also run the probe:
+
+```bash
+python probe.py            # dumps live markets + detected asset/timeframe
+python probe.py --limit 1000 --show 60
+```
+
+This confirms whether BTC/ETH 5m·15m markets are actually being served and how
+they're classified — handy for tuning if Polymarket changes its market shapes.
+
+## Adaptive learning
+
+When enabled (default), the bot keeps a Beta-Bernoulli **win rate per
+(asset, timeframe, direction)** bucket, learning from every closed trade and
+**persisting to `.botstate/learning.json`** so it keeps improving across runs.
+The learned win rate:
+
+- **adjusts confidence** in the scanner, and
+- **vetoes** a bucket once it has enough samples and its win rate falls below a
+  floor (default 45%), with the reason shown in the scanner / debug panel.
 
 ## Features
 
@@ -27,7 +55,11 @@ the market question and slug (e.g. `Bitcoin Up or Down — 5 minute`).
 - **Momentum signal** — direction (UP/DOWN) is chosen from short-term spot
   momentum (BTC/ETH price from Binance, falling back to Coinbase, then a
   simulated feed), with a confidence score and a written reason per market.
-- **Auto-refreshing dashboard** (every 10–15 s) with the last scan time.
+- **Adaptive learning** — learns win rates per asset/timeframe/direction from
+  closed trades and feeds them back into confidence and trade gating.
+- **Dual-cadence dashboard** — prices/PnL refresh on a fast loop (default 3 s)
+  while market scanning runs on a slower loop (default 10 s), via Streamlit
+  fragments, with charts for spot history and the equity curve.
 
 ## Dashboard sections
 

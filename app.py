@@ -3,8 +3,9 @@
 Run with:  streamlit run app.py
 
 Defaults to Live Data Paper Trading — real prices, simulated fills. No real
-orders are placed unless the operator switches to LIVE mode *and* ticks the
-"enable real orders" box. Trades only BTC/ETH 5m & 15m up/down markets.
+orders unless LIVE mode + the explicit enable box. Trades only BTC/ETH 5m & 15m
+up/down markets. Prices/PnL refresh on a fast loop; market scanning on a slower
+loop; both via Streamlit fragments.
 """
 
 from __future__ import annotations
@@ -16,18 +17,22 @@ from bot.config import Settings, TradingMode
 from bot.engine import TradingEngine
 from bot.performance import compute_performance, daily_stats
 
-try:
-    from streamlit_autorefresh import st_autorefresh
-    HAVE_AUTOREFRESH = True
-except ImportError:  # graceful fallback if the helper package isn't installed
-    HAVE_AUTOREFRESH = False
-
 st.set_page_config(page_title="Polymarket 10% TP Bot", page_icon="📈", layout="wide")
+
+ACCENT = {"UP": "🟢", "DOWN": "🔴", "NEUTRAL": "⚪"}
 
 
 # --------------------------------------------------------------------------- #
 # State
 # --------------------------------------------------------------------------- #
+def _engine() -> TradingEngine:
+    return st.session_state.engine
+
+
+def _settings() -> Settings:
+    return st.session_state.settings
+
+
 def _rebuild_engine(settings: Settings) -> None:
     old = st.session_state.get("engine")
     engine = TradingEngine(settings)
@@ -35,7 +40,11 @@ def _rebuild_engine(settings: Settings) -> None:
         engine.closed_trades = old.closed_trades
         engine.realized_pnl = old.realized_pnl
         engine.positions = old.positions
-    engine.tick()  # one scan so the dashboard renders with data immediately
+        engine.equity_curve = old.equity_curve
+        if old.learner is not None:
+            engine.learner = old.learner
+    engine.refresh_prices()
+    engine.scan()
     st.session_state.engine = engine
 
 
@@ -52,15 +61,15 @@ def _apply_settings_to_open_positions(settings: Settings) -> None:
 # --------------------------------------------------------------------------- #
 # Sidebar
 # --------------------------------------------------------------------------- #
-def sidebar() -> tuple[Settings, int]:
+def sidebar() -> tuple[Settings, int, int, bool]:
     st.sidebar.title("⚙️ Bot Settings")
     settings = st.session_state.get("settings", Settings())
 
     st.sidebar.subheader("Risk Management")
     tp = st.sidebar.number_input("Take Profit %", 0.1, 100.0, float(settings.take_profit_pct), 0.5)
-    sl_enabled = st.sidebar.checkbox("Enable Stop Loss", settings.stop_loss_enabled)
+    sl_on = st.sidebar.checkbox("Enable Stop Loss", settings.stop_loss_enabled)
     sl = st.sidebar.number_input("Stop Loss %", 0.1, 100.0, float(settings.stop_loss_pct), 0.5,
-                                 disabled=not sl_enabled)
+                                 disabled=not sl_on)
 
     st.sidebar.subheader("Markets")
     assets = st.sidebar.multiselect("Assets", ["BTC", "ETH", "SOL", "XRP"], list(settings.assets))
@@ -71,6 +80,8 @@ def sidebar() -> tuple[Settings, int]:
                                        float(settings.momentum_threshold_pct), 0.01, format="%.3f")
     size = st.sidebar.number_input("Order Size (USDC)", 1.0, 100000.0, float(settings.order_size_usdc), 10.0)
     max_pos = st.sidebar.number_input("Max Open Positions", 1, 50, int(settings.max_open_positions), 1)
+    learning = st.sidebar.checkbox("Adaptive learning", settings.learning_enabled,
+                                   help="Learn win rates per asset/timeframe/direction and adjust trading.")
 
     st.sidebar.subheader("Trading Mode")
     mode = st.sidebar.selectbox("Mode", list(TradingMode),
@@ -78,110 +89,140 @@ def sidebar() -> tuple[Settings, int]:
                                 format_func=lambda m: m.value)
     live_enabled = False
     if mode == TradingMode.LIVE:
-        st.sidebar.error("⚠️ LIVE mode submits REAL orders and risks REAL funds.")
+        st.sidebar.error("⚠️ LIVE mode submits REAL orders.")
         live_enabled = st.sidebar.checkbox("I understand — enable real orders", value=False)
     else:
         st.sidebar.success("🧪 Paper trading — no real orders.")
 
-    st.sidebar.subheader("Auto-refresh")
-    auto = st.sidebar.toggle("Auto-run", value=st.session_state.get("auto", True))
+    st.sidebar.subheader("Refresh")
+    auto = st.sidebar.toggle("Auto-refresh", value=st.session_state.get("auto", True))
     st.session_state.auto = auto
-    interval = st.sidebar.slider("Refresh interval (s)", 10, 15, st.session_state.get("interval", 12))
-    st.session_state.interval = interval
+    price_secs = st.sidebar.slider("Price refresh (s)", 1, 10, int(settings.price_refresh_secs))
+    scan_secs = st.sidebar.slider("Market scan (s)", 5, 30, int(settings.scan_refresh_secs))
 
     new_settings = Settings(
-        take_profit_pct=tp, stop_loss_enabled=sl_enabled, stop_loss_pct=sl,
+        take_profit_pct=tp, stop_loss_enabled=sl_on, stop_loss_pct=sl,
         mode=mode, live_trading_enabled=live_enabled,
         max_open_positions=int(max_pos), order_size_usdc=size,
-        momentum_threshold_pct=momentum,
+        momentum_threshold_pct=momentum, learning_enabled=learning,
+        price_refresh_secs=price_secs, scan_refresh_secs=scan_secs,
         assets=tuple(assets) or ("BTC", "ETH"),
         timeframes=tuple(timeframes) or ("5m", "15m"),
     )
 
-    mode_changed = (new_settings.mode != settings.mode
-                    or new_settings.assets != settings.assets)
+    structural = (new_settings.mode != settings.mode
+                  or new_settings.assets != settings.assets
+                  or new_settings.learning_enabled != settings.learning_enabled)
     st.session_state.settings = new_settings
     _apply_settings_to_open_positions(new_settings)
-    if mode_changed or "engine" not in st.session_state:
+    if structural or "engine" not in st.session_state:
         _rebuild_engine(new_settings)
     else:
         st.session_state.engine.settings = new_settings
-    return new_settings, interval
+    return new_settings, price_secs, scan_secs, auto
 
 
 # --------------------------------------------------------------------------- #
-# Sections
+# Renderers (each reads current engine/settings from session_state)
 # --------------------------------------------------------------------------- #
-def section_live_prices(engine, settings):
+def render_header():
+    engine, settings = _engine(), _settings()
+    c = st.columns([1, 1, 1, 1, 2])
+    c[0].metric("Total PnL", f"{engine.total_pnl:,.2f}")
+    c[1].metric("Realized", f"{engine.realized_pnl:,.2f}")
+    c[2].metric("Unrealized", f"{engine.unrealized_pnl:,.2f}")
+    c[3].metric("Open", len(engine.positions))
+    feed = engine.spot_feed
+    badge = "🟢 live" if (feed.source not in ("Simulated", "—")) else "🟡 sim"
+    c[4].metric("Spot source", f"{feed.source} {badge}", f"updated {feed.last_updated_str}")
+
+
+def render_prices():
+    """FAST loop: refresh spot + marks + exits, then draw live prices."""
+    engine, settings = _engine(), _settings()
+    engine.refresh_prices()
+
+    render_header()
     st.subheader("1 · Live Prices")
     feed = engine.spot_feed
-    cols = st.columns(len(feed.assets) + 3)
+    cols = st.columns(len(feed.assets))
     for i, asset in enumerate(feed.assets):
-        cols[i].metric(f"{asset} price",
-                       f"${feed.price(asset):,.2f}",
-                       f"{feed.momentum(asset):+.3f}% mom")
-    cols[-3].metric("Price source", feed.source)
-    cols[-2].metric("Last updated", feed.last_updated_str)
-    status_ok = feed.source != "Simulated"
-    cols[-1].metric("API status", "🟢 live" if status_ok else "🟡 fallback")
+        with cols[i]:
+            st.metric(f"{asset}/USD", f"${feed.price(asset):,.2f}", f"{feed.momentum(asset):+.3f}% mom")
+            hist = list(feed.ticks[asset].history)
+            if len(hist) >= 2:
+                st.line_chart(pd.DataFrame({asset: hist}), height=120)
+    st.caption(f"Source: **{feed.source}** · Last updated: **{feed.last_updated_str}** · "
+               f"API: Binance `{feed.binance_status}` · Coinbase `{feed.coinbase_status}`")
 
 
-def section_scanner(engine):
+def render_scanner():
+    """SLOW loop: discover markets + open trades, then draw the scanner."""
+    engine, settings = _engine(), _settings()
+    engine.scan()
+
+    r = engine.last_report
     st.subheader("2 · Opportunity Scanner")
-    report = engine.last_report
-    st.caption(f"Last scan: {report.time_str} · returned {report.markets_returned} · "
-               f"accepted {report.markets_accepted}")
-    rows = [o.to_dashboard_row() for o in report.opportunities]
+    st.caption(f"Last scan: **{r.time_str}** · returned **{r.markets_returned}** · "
+               f"accepted **{r.markets_accepted}** (BTC/ETH {'/'.join(settings.timeframes)})")
+    rows = [o.to_dashboard_row() for o in sorted(
+        r.opportunities, key=lambda o: (o.will_trade, o.confidence), reverse=True)]
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
-        st.write("_No markets matched the BTC/ETH 5m·15m universe this scan._")
+        st.warning(
+            "No markets matched the BTC/ETH 5m·15m universe this scan. "
+            "Open the Debug panel below to see the raw markets the API returned "
+            "and their detected asset/timeframe."
+        )
 
 
-def section_open_positions(engine):
+def render_positions():
+    engine = _engine()
     st.subheader("3 · Open Positions")
+    cc = st.columns([1, 5])
+    if cc[0].button("🧹 Close all", use_container_width=True):
+        engine.close_all()
     rows = engine.open_rows()
     if rows:
         df = pd.DataFrame(rows)
         st.dataframe(df.style.map(_pnl_color, subset=["Unrealized PnL", "PnL %"]),
                      use_container_width=True, hide_index=True)
     else:
-        st.write("_No open positions._")
+        cc[1].write("_No open positions yet._")
 
 
-def section_closed_trades(engine):
+def render_trades_and_performance():
+    engine = _engine()
+
     st.subheader("4 · Closed Trades")
     rows = engine.closed_rows()
     if rows:
         df = pd.DataFrame(rows)
         st.dataframe(df.style.map(_pnl_color, subset=["Profit %", "PnL"]),
                      use_container_width=True, hide_index=True)
-        tp = sum(1 for t in engine.closed_trades if t.exit_reason.startswith("TAKE_PROFIT"))
-        sl = sum(1 for t in engine.closed_trades if t.exit_reason.startswith("STOP_LOSS"))
-        st.caption(f"Take-profit exits: {tp} · Stop-loss exits: {sl} · Total: {len(engine.closed_trades)}")
     else:
         st.write("_No closed trades yet._")
 
-
-def section_performance(engine):
     st.subheader("5 · Performance")
     p = compute_performance(engine.closed_trades)
     pf = "∞" if p["profit_factor"] == float("inf") else f"{p['profit_factor']:.2f}"
-    c = st.columns(5)
-    c[0].metric("Total trades", p["total_trades"])
-    c[1].metric("Wins", p["wins"])
-    c[2].metric("Losses", p["losses"])
-    c[3].metric("Win rate", f"{p['win_rate']:.1f}%")
-    c[4].metric("Net PnL", f"{p['net_pnl']:,.2f}")
-    c = st.columns(5)
-    c[0].metric("ROI", f"{p['roi_pct']:.2f}%")
-    c[1].metric("Avg win", f"{p['avg_win']:,.2f}")
-    c[2].metric("Avg loss", f"{p['avg_loss']:,.2f}")
-    c[3].metric("Profit factor", pf)
-    c[4].metric("Max drawdown", f"{p['max_drawdown']:,.2f}")
+    a = st.columns(5)
+    a[0].metric("Total trades", p["total_trades"])
+    a[1].metric("Wins", p["wins"])
+    a[2].metric("Losses", p["losses"])
+    a[3].metric("Win rate", f"{p['win_rate']:.1f}%")
+    a[4].metric("Net PnL", f"{p['net_pnl']:,.2f}")
+    b = st.columns(5)
+    b[0].metric("ROI", f"{p['roi_pct']:.2f}%")
+    b[1].metric("Avg win", f"{p['avg_win']:,.2f}")
+    b[2].metric("Avg loss", f"{p['avg_loss']:,.2f}")
+    b[3].metric("Profit factor", pf)
+    b[4].metric("Max drawdown", f"{p['max_drawdown']:,.2f}")
+    if engine.equity_curve:
+        st.caption("Equity curve (cumulative realized PnL)")
+        st.area_chart(pd.DataFrame({"PnL": engine.equity_curve}), height=160)
 
-
-def section_daily(engine):
     st.subheader("6 · Daily Stats (today, UTC)")
     d = daily_stats(engine.closed_trades)
     c = st.columns(3)
@@ -189,34 +230,48 @@ def section_daily(engine):
     c[1].metric("Win rate today", f"{d['win_rate_today']:.1f}%")
     c[2].metric("PnL today", f"{d['pnl_today']:,.2f}")
 
+    if engine.learner is not None:
+        with st.expander("🧠 Learned model (win rate per asset · timeframe · direction)", expanded=False):
+            lrows = engine.learner.stats_rows()
+            if lrows:
+                st.dataframe(pd.DataFrame(lrows), use_container_width=True, hide_index=True)
+            else:
+                st.write("_No learning data yet — it builds as trades close and persists to disk._")
 
-def section_debug(engine):
-    st.subheader("7 · Debug Panel")
-    report = engine.last_report
+
+def render_debug():
+    engine, settings = _engine(), _settings()
+    r = engine.last_report
     feed = engine.spot_feed
+    st.subheader("7 · Debug Panel")
     c = st.columns(2)
     with c[0]:
         st.markdown("**API status**")
         st.write({
             "Polymarket": engine.feed_message,
-            "Polymarket using fallback": engine.using_fallback,
+            "Polymarket fallback": engine.using_fallback,
             "Spot source": feed.source,
             "Binance": feed.binance_status,
             "Coinbase": feed.coinbase_status,
         })
         st.markdown("**Scan counts**")
         st.write({
-            "last scan": report.time_str,
-            "markets returned": report.markets_returned,
-            "markets accepted": report.markets_accepted,
-            "opportunities": len(report.opportunities),
-            "skipped": len(report.skipped),
+            "last scan": r.time_str,
+            "markets returned": r.markets_returned,
+            "markets accepted": r.markets_accepted,
+            "opportunities": len(r.opportunities),
+            "skipped": len(r.skipped),
         })
+        st.markdown("**Raw markets returned (detected asset / timeframe)**")
+        if r.raw_sample:
+            st.dataframe(pd.DataFrame(r.raw_sample), use_container_width=True, hide_index=True, height=220)
+        else:
+            st.write("_No raw markets captured._")
     with c[1]:
         st.markdown("**Skipped markets (reasons)**")
-        if report.skipped:
-            st.dataframe(pd.DataFrame(report.skipped, columns=["Market", "Reason"]),
-                         use_container_width=True, hide_index=True, height=320)
+        if r.skipped:
+            st.dataframe(pd.DataFrame(r.skipped, columns=["Market", "Reason"]),
+                         use_container_width=True, hide_index=True, height=480)
         else:
             st.write("_Nothing skipped this scan._")
 
@@ -225,58 +280,35 @@ def section_debug(engine):
 # Main
 # --------------------------------------------------------------------------- #
 def main() -> None:
-    settings, interval = sidebar()
-
-    # Auto-refresh: drive a tick every `interval` seconds.
-    if st.session_state.get("auto", True):
-        if HAVE_AUTOREFRESH:
-            st_autorefresh(interval=interval * 1000, key="auto_refresh")
-            st.session_state.engine.tick()
-    engine: TradingEngine = st.session_state.engine
+    settings, price_secs, scan_secs, auto = sidebar()
 
     st.title("📈 Polymarket 10% Take-Profit Bot — BTC/ETH 5m·15m")
-
-    top = st.columns([1, 1, 1, 3])
-    if top[0].button("▶️ Scan now", use_container_width=True):
-        engine.tick()
-    if top[1].button("🧹 Close all", use_container_width=True):
-        engine.close_all()
-    refresh_note = (f"auto every {interval}s" if st.session_state.get("auto", True) else "manual")
-    top[2].metric("Mode", "PAPER" if not settings.real_orders_active else "LIVE")
-    top[3].caption(
-        f"Refresh: **{refresh_note}** · Last scan: **{engine.last_report.time_str}** · "
-        f"Universe: **{'/'.join(settings.assets)} @ {'/'.join(settings.timeframes)}** · "
-        f"TP **{settings.take_profit_pct:.0f}%** / SL "
-        f"**{settings.stop_loss_pct:.0f}%{'' if settings.stop_loss_enabled else ' (off)'}**"
+    top = st.columns([1, 1, 4])
+    if top[0].button("🔄 Refresh now", use_container_width=True):
+        _engine().refresh_prices()
+    if top[1].button("🔎 Scan now", use_container_width=True):
+        _engine().scan()
+    mode_txt = "🔴 LIVE (real orders)" if settings.real_orders_active else "🧪 PAPER"
+    top[2].caption(
+        f"{mode_txt} · TP **{settings.take_profit_pct:.0f}%** / SL "
+        f"**{settings.stop_loss_pct:.0f}%{'' if settings.stop_loss_enabled else ' off'}** · "
+        f"refresh **{price_secs}s** · scan **{scan_secs}s** · "
+        f"learning **{'on' if settings.learning_enabled else 'off'}**"
     )
-
     if settings.real_orders_active:
         st.error("🔴 REAL ORDERS ARE ACTIVE — the bot will trade real funds.")
-    elif engine.using_fallback:
-        st.warning(f"📡 {engine.feed_message}")
-    else:
-        st.info(f"📡 {engine.feed_message}")
+    elif _engine().using_fallback:
+        st.warning(f"📡 {_engine().feed_message}")
 
-    section_live_prices(engine, settings)
-    st.divider()
-    section_scanner(engine)
-    st.divider()
-    section_open_positions(engine)
-    st.divider()
-    section_closed_trades(engine)
-    st.divider()
-    section_performance(engine)
-    st.divider()
-    section_daily(engine)
-    st.divider()
-    section_debug(engine)
+    # Fragments: fast loop for prices/PnL, slow loop for market scanning.
+    fast = price_secs if auto else None
+    slow = scan_secs if auto else None
 
-    # Fallback auto-refresh when the helper package isn't installed.
-    if st.session_state.get("auto", True) and not HAVE_AUTOREFRESH:
-        import time
-        engine.tick()
-        time.sleep(interval)
-        st.rerun()
+    st.fragment(render_prices, run_every=fast)()
+    st.fragment(render_scanner, run_every=slow)()
+    st.fragment(render_positions, run_every=fast)()
+    st.fragment(render_trades_and_performance, run_every=fast)()
+    st.fragment(render_debug, run_every=slow)()
 
 
 def _pnl_color(val):

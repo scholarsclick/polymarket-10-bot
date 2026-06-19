@@ -30,6 +30,8 @@ class Opportunity:
     reason_trade: str
     reason_no_trade: str
     token_id: str = ""
+    learned_winrate: float = 0.0  # historical win rate for this bucket (0..1)
+    learned_samples: int = 0
 
     def time_left_str(self) -> str:
         return _time_left(self.expiry)
@@ -45,15 +47,22 @@ class Opportunity:
             "Spread": round(self.spread, 3),
             "Signal": self.signal,
             "Confidence": f"{self.confidence:.0f}%",
+            "Hist WR": f"{self.learned_winrate*100:.0f}% (n={self.learned_samples})",
             "Trade?": "✅" if self.will_trade else "—",
             "Reason (trade)": self.reason_trade or "",
             "Reason (no trade)": self.reason_no_trade or "",
         }
 
 
-def evaluate(quote, spot_feed, settings, held: set[str]) -> Opportunity:
-    """Build an Opportunity for a single market quote."""
+def evaluate(quote, spot_feed, settings, held: set[str], learner=None) -> Opportunity:
+    """Build an Opportunity for a single market quote.
+
+    The ``learner`` (optional) supplies a historical win rate per
+    (asset, timeframe, direction) bucket, which adjusts confidence and can veto
+    buckets that have proven unprofitable.
+    """
     asset = quote.asset or "?"
+    timeframe = quote.timeframe or "?"
     momentum = spot_feed.momentum(asset)
     thr = settings.momentum_threshold_pct
 
@@ -68,15 +77,24 @@ def evaluate(quote, spot_feed, settings, held: set[str]) -> Opportunity:
     side = signal if signal != "NEUTRAL" else "UP"
     entry_price = quote.price_for(side)
 
-    # 2) Confidence: scales with how far momentum exceeds the threshold,
-    #    bounded to [50, 95]. Neutral signals get low confidence.
+    # 2) Base confidence from momentum strength, bounded to [50, 95].
     if signal == "NEUTRAL":
         confidence = round(min(49.0, 50.0 * abs(momentum) / thr if thr else 0.0), 1)
     else:
         over = (abs(momentum) - thr) / thr if thr else 0.0
         confidence = round(min(95.0, 55.0 + 40.0 * min(1.0, over)), 1)
 
-    # 3) Trade gates → reasons.
+    # 3) Learned adjustment: blend in the historical win rate for this bucket.
+    learned_wr = 0.0
+    learned_n = 0
+    learn_veto = ""
+    if learner is not None and signal != "NEUTRAL":
+        learned_wr = learner.winrate(asset, timeframe, side)
+        learned_n = learner.samples(asset, timeframe, side)
+        confidence = round(min(98.0, confidence * learner.confidence_multiplier(asset, timeframe, side)), 1)
+        ok, learn_veto = learner.should_trade(asset, timeframe, side)
+
+    # 4) Trade gates → reasons.
     reason_trade = ""
     reason_no_trade = ""
     will_trade = True
@@ -96,17 +114,21 @@ def evaluate(quote, spot_feed, settings, held: set[str]) -> Opportunity:
     elif quote.spread > settings.max_spread:
         will_trade = False
         reason_no_trade = f"spread {quote.spread:.3f} > max {settings.max_spread:.3f}"
+    elif learn_veto:
+        will_trade = False
+        reason_no_trade = learn_veto
     else:
+        wr_note = f", hist WR {learned_wr*100:.0f}% (n={learned_n})" if learned_n else ""
         reason_trade = (
             f"{asset} spot {momentum:+.3f}% → {side}; "
-            f"{side} @ {entry_price:.2f} in band, conf {confidence:.0f}%"
+            f"{side} @ {entry_price:.2f} in band, conf {confidence:.0f}%{wr_note}"
         )
 
     return Opportunity(
         market_id=quote.market_id,
         title=quote.question,
         asset=asset,
-        timeframe=quote.timeframe or "?",
+        timeframe=timeframe,
         expiry=quote.expiry,
         up_price=quote.up_price,
         down_price=quote.down_price,
@@ -119,6 +141,8 @@ def evaluate(quote, spot_feed, settings, held: set[str]) -> Opportunity:
         reason_trade=reason_trade,
         reason_no_trade=reason_no_trade,
         token_id=quote.token_for(side),
+        learned_winrate=learned_wr,
+        learned_samples=learned_n,
     )
 
 

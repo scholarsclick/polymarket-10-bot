@@ -64,12 +64,30 @@ class Settings:
     #: Skip markets whose implied spread (1 - up - down) exceeds this.
     max_spread: float = 0.06
 
+    # --- Adaptive learning ------------------------------------------------
+    #: Learn per (asset, timeframe, direction) win rates from closed trades and
+    #: feed them back into confidence + trade gating.
+    learning_enabled: bool = True
+    #: Minimum trades in a bucket before its learned win rate can veto a trade.
+    learn_min_samples: int = 6
+    #: Skip a bucket once its learned win rate drops below this floor.
+    learn_winrate_floor: float = 0.45
+    #: Beta prior (optimistic) so unseen buckets still trade while exploring.
+    learn_prior_alpha: float = 2.0
+    learn_prior_beta: float = 2.0
+    #: Where the learned model is persisted between runs.
+    state_dir: str = ".botstate"
+
+    # --- Refresh cadence (dashboard) --------------------------------------
+    price_refresh_secs: int = 3   # fast loop: spot prices, marks, exits
+    scan_refresh_secs: int = 10   # slow loop: discover markets + open trades
+
     # --- Data feed --------------------------------------------------------
     #: Hosts must be reachable (allowlisted) for live data. If unreachable
     #: the engine automatically falls back to the simulated feed.
     gamma_api_url: str = "https://gamma-api.polymarket.com"
     clob_api_url: str = "https://clob.polymarket.com"
-    market_scan_limit: int = 200
+    market_scan_limit: int = 500
 
     # Internal: tags used in exit reasons / dashboards
     base_currency: str = "USDC"

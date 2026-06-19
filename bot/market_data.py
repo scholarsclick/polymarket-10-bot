@@ -51,10 +51,28 @@ def classify_asset(text: str) -> str | None:
     return None
 
 
-def classify_timeframe(text: str) -> str | None:
+def classify_timeframe_by_duration(minutes: float | None) -> str | None:
+    """Map a market's window length (minutes) to a known timeframe bucket.
+
+    This is far more robust than text matching: a 5-minute market has an
+    end-minus-start window of ~5 minutes regardless of how its title is phrased.
+    """
+    if not minutes or minutes <= 0:
+        return None
+    # (label, low, high) tolerance bands.
+    bands = [("5m", 3, 8), ("15m", 11, 20), ("1h", 45, 75), ("1d", 1200, 1560)]
+    for label, lo, hi in bands:
+        if lo <= minutes <= hi:
+            return label
+    return None
+
+
+def classify_timeframe(text: str, duration_min: float | None = None) -> str | None:
+    """Classify timeframe by window duration first, then fall back to text."""
+    by_dur = classify_timeframe_by_duration(duration_min)
+    if by_dur:
+        return by_dur
     blob = (text or "").lower()
-    # Check 15m before 5m is unnecessary thanks to word boundaries, but keep a
-    # deterministic order anyway.
     for tf in ("5m", "15m", "1h", "1d"):
         if any(re.search(p, blob) for p in TIMEFRAME_PATTERNS[tf]):
             return tf
@@ -87,6 +105,7 @@ class MarketQuote:
     asset: str = ""
     timeframe: str = ""
     expiry: datetime | None = None
+    duration_min: float | None = None
 
     def __post_init__(self) -> None:
         if not self.up_token_id:
@@ -99,7 +118,13 @@ class MarketQuote:
         if not self.asset:
             self.asset = classify_asset(self.search_text) or ""
         if not self.timeframe:
-            self.timeframe = classify_timeframe(self.search_text) or ""
+            self.timeframe = classify_timeframe(self.search_text, self.duration_min) or ""
+
+    def in_universe(self, assets, timeframes) -> bool:
+        return (
+            self.asset in {a.upper() for a in assets}
+            and self.timeframe in {t.lower() for t in timeframes}
+        )
 
     @property
     def search_text(self) -> str:
@@ -134,31 +159,53 @@ class LivePolymarketProvider:
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "polymarket-10-bot/1.0"})
+        #: Sample of the most recent raw markets seen, for the debug panel.
+        self.last_raw: list[dict] = []
 
     @property
     def name(self) -> str:
         return "Live Polymarket"
 
     def list_markets(self, limit: int) -> list[MarketQuote]:
-        """Return currently active, tradable binary markets."""
+        """Return currently active, tradable binary markets (paginated)."""
         url = f"{self.gamma_api_url}/markets"
-        params = {
-            "active": "true",
-            "closed": "false",
-            "limit": str(limit),
-            "order": "volume24hr",
-            "ascending": "false",
-        }
-        resp = self.session.get(url, params=params, timeout=self.timeout)
-        if resp.status_code != 200:
-            raise MarketDataError(
-                f"Gamma API returned {resp.status_code}: {resp.text[:120]}"
-            )
         quotes: list[MarketQuote] = []
-        for m in resp.json():
-            quote = self._parse_market(m)
-            if quote is not None:
-                quotes.append(quote)
+        raw: list[dict] = []
+        page = min(100, limit)
+        offset = 0
+        first_status = None
+        while offset < limit:
+            params = {
+                "active": "true",
+                "closed": "false",
+                "limit": str(page),
+                "offset": str(offset),
+                "order": "endDate",
+                "ascending": "true",  # soonest-expiring first → short markets surface
+            }
+            resp = self.session.get(url, params=params, timeout=self.timeout)
+            if resp.status_code != 200:
+                if offset == 0:
+                    raise MarketDataError(
+                        f"Gamma API returned {resp.status_code}: {resp.text[:120]}"
+                    )
+                break
+            batch = resp.json()
+            if not batch:
+                break
+            for m in batch:
+                quote = self._parse_market(m)
+                if quote is not None:
+                    quotes.append(quote)
+                    if len(raw) < 40:
+                        raw.append({
+                            "title": quote.question[:60],
+                            "asset": quote.asset or "?",
+                            "tf": quote.timeframe or "?",
+                            "dur_min": round(quote.duration_min, 1) if quote.duration_min else None,
+                        })
+            offset += page
+        self.last_raw = raw
         if not quotes:
             raise MarketDataError("Gamma API returned no tradable markets.")
         return quotes
@@ -170,13 +217,16 @@ class LivePolymarketProvider:
             prices = _maybe_json(m.get("outcomePrices")) or []
             if len(token_ids) < 2 or len(outcomes) < 2 or len(prices) < 2:
                 return None
-            # Identify which index is the UP/YES side.
             up_idx = 0
             for i, o in enumerate(outcomes):
                 if str(o).strip().lower() in {"up", "yes"}:
                     up_idx = i
                     break
             down_idx = 1 - up_idx if len(outcomes) == 2 else (up_idx + 1) % len(outcomes)
+            start = _parse_dt(m.get("startDate") or m.get("start_date_iso")
+                              or m.get("acceptingOrdersTimestamp"))
+            end = _parse_dt(m.get("endDate") or m.get("end_date_iso"))
+            duration = (end - start).total_seconds() / 60.0 if (start and end) else None
             return MarketQuote(
                 market_id=str(m.get("id")),
                 token_id=str(token_ids[up_idx]),
@@ -188,7 +238,8 @@ class LivePolymarketProvider:
                 down_price=float(prices[down_idx]),
                 up_token_id=str(token_ids[up_idx]),
                 down_token_id=str(token_ids[down_idx]),
-                expiry=_parse_dt(m.get("endDate") or m.get("end_date_iso")),
+                expiry=end,
+                duration_min=duration,
             )
         except (ValueError, IndexError, TypeError):
             return None
@@ -217,6 +268,8 @@ class SimulatedProvider:
         self._drift = drift
         self._vol = vol
         self._prices: dict[str, float] = {}
+        self._tf: dict[str, str] = {}  # market_id -> timeframe
+        self.last_raw: list[dict] = []
         self._catalog = self._build_catalog()
 
     @property
@@ -241,6 +294,7 @@ class SimulatedProvider:
             up_tid, down_tid = f"sim-{i}-up", f"sim-{i}-down"
             self._prices[up_tid] = up
             self._prices[down_tid] = round(1.0 - up, 4)
+            self._tf[f"sim-{i}"] = tf
             catalog.append(
                 MarketQuote(
                     market_id=f"sim-{i}",
@@ -254,13 +308,20 @@ class SimulatedProvider:
                     up_token_id=up_tid,
                     down_token_id=down_tid,
                     expiry=now + timedelta(minutes=TIMEFRAME_MINUTES[tf]),
+                    timeframe=tf,
+                    duration_min=TIMEFRAME_MINUTES[tf],
                 )
             )
         return catalog
 
     def list_markets(self, limit: int) -> list[MarketQuote]:
-        out = []
+        now = datetime.now(timezone.utc)
+        out, raw = [], []
         for q in self._catalog[:limit]:
+            tf = self._tf[q.market_id]
+            # Roll the expiry forward so the countdown always looks live.
+            secs_into = int(now.timestamp()) % (TIMEFRAME_MINUTES[tf] * 60)
+            expiry = now + timedelta(seconds=TIMEFRAME_MINUTES[tf] * 60 - secs_into)
             out.append(
                 MarketQuote(
                     market_id=q.market_id,
@@ -273,9 +334,14 @@ class SimulatedProvider:
                     down_price=self._prices[q.down_token_id],
                     up_token_id=q.up_token_id,
                     down_token_id=q.down_token_id,
-                    expiry=q.expiry,
+                    expiry=expiry,
+                    timeframe=tf,
+                    duration_min=TIMEFRAME_MINUTES[tf],
                 )
             )
+            raw.append({"title": q.question[:60], "asset": q.asset, "tf": tf,
+                        "dur_min": TIMEFRAME_MINUTES[tf]})
+        self.last_raw = raw
         return out
 
     def get_price(self, token_id: str) -> float:

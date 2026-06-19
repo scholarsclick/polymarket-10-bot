@@ -57,6 +57,7 @@ class _StubProvider:
 
 
 def _engine(price=0.50, momentum=0.5, **kw):
+    kw.setdefault("learning_enabled", False)  # keep tests off-disk
     settings = Settings(order_size_usdc=100, entry_price_min=0.4, entry_price_max=0.6, **kw)
     return TradingEngine(settings, provider=_StubProvider(price), spot_feed=_StubSpot(momentum))
 
@@ -105,10 +106,32 @@ def test_engine_only_enters_filtered_markets():
         def list_markets(self, limit): return self._q
         def get_price(self, token_id): return 0.50
 
-    settings = Settings(entry_price_min=0.4, entry_price_max=0.6)
+    settings = Settings(entry_price_min=0.4, entry_price_max=0.6, learning_enabled=False)
     engine = TradingEngine(settings, provider=MixedProvider(), spot_feed=_StubSpot(0.5))
     engine.tick()
     assert [p.token_id for p in engine.positions.values()] == ["t1"]
+
+
+# --------------------------------------------------------------------------- #
+# Timeframe-by-duration classification (robust market detection)
+# --------------------------------------------------------------------------- #
+def test_classify_timeframe_by_duration():
+    from bot.market_data import classify_timeframe_by_duration, classify_timeframe
+    assert classify_timeframe_by_duration(5) == "5m"
+    assert classify_timeframe_by_duration(15) == "15m"
+    assert classify_timeframe_by_duration(60) == "1h"
+    assert classify_timeframe_by_duration(7) == "5m"   # within tolerance band
+    assert classify_timeframe_by_duration(30) is None  # between buckets
+    # Duration wins even when the title says nothing about time.
+    assert classify_timeframe("Bitcoin Up or Down", duration_min=15) == "15m"
+
+
+def test_quote_in_universe_uses_duration():
+    # Title lacks an explicit timeframe; duration drives classification.
+    q = MarketQuote("1", "t1", "BTC Up or Down", "Up", 0.50, "btc", duration_min=5)
+    assert q.timeframe == "5m" and q.asset == "BTC"
+    assert q.in_universe(("BTC", "ETH"), ("5m", "15m"))
+    assert not q.in_universe(("ETH",), ("5m",))
 
 
 # --------------------------------------------------------------------------- #
@@ -313,3 +336,63 @@ def test_paper_engine_never_submits_real_orders():
     engine.tick()
     engine.provider._price = 0.55
     engine.tick(allow_entries=False)  # would raise if the real-order path were hit
+
+
+# --------------------------------------------------------------------------- #
+# Adaptive learning
+# --------------------------------------------------------------------------- #
+def test_learning_winrate_moves_with_outcomes():
+    from bot.learning import LearningModel
+    m = LearningModel(prior_alpha=1, prior_beta=1)
+    base = m.winrate("BTC", "5m", "UP")
+    for _ in range(8):
+        m.record("BTC", "5m", "UP", won=True)
+    assert m.winrate("BTC", "5m", "UP") > base
+    assert m.samples("BTC", "5m", "UP") == 8
+
+
+def test_learning_vetoes_losing_bucket():
+    from bot.learning import LearningModel
+    m = LearningModel(prior_alpha=1, prior_beta=1, min_samples=5, winrate_floor=0.45)
+    for _ in range(8):
+        m.record("ETH", "15m", "DOWN", won=False)
+    ok, reason = m.should_trade("ETH", "15m", "DOWN")
+    assert ok is False and "learned win rate" in reason
+    # A fresh bucket with no history is allowed to trade (exploration).
+    ok2, _ = m.should_trade("BTC", "5m", "UP")
+    assert ok2 is True
+
+
+def test_learning_persists_to_disk(tmp_path):
+    from bot.learning import LearningModel
+    path = str(tmp_path / "learn.json")
+    m = LearningModel(path=path)
+    m.record("BTC", "5m", "UP", won=True)
+    m.record("BTC", "5m", "UP", won=False)
+    m.save()
+    reloaded = LearningModel(path=path)
+    assert reloaded.samples("BTC", "5m", "UP") == 2
+
+
+def test_scanner_uses_learner_to_veto():
+    from bot.learning import LearningModel
+    m = LearningModel(prior_alpha=1, prior_beta=1, min_samples=4, winrate_floor=0.5)
+    for _ in range(6):
+        m.record("BTC", "5m", "UP", won=False)
+    q = MarketQuote("1", "t1", "Bitcoin Up or Down — 5 minute", "Up", 0.50, "btc-5m")
+    opp = scanner.evaluate(q, _StubSpot(0.5), Settings(), held=set(), learner=m)
+    assert not opp.will_trade and "learned win rate" in opp.reason_no_trade
+
+
+def test_engine_records_learning_on_close(tmp_path):
+    learner_path = str(tmp_path / "l.json")
+    from bot.learning import LearningModel
+    learner = LearningModel(path=learner_path, min_samples=99)  # never veto here
+    settings = Settings(order_size_usdc=100, entry_price_min=0.4, entry_price_max=0.6)
+    engine = TradingEngine(settings, provider=_StubProvider(0.50),
+                           spot_feed=_StubSpot(0.5), learner=learner)
+    engine.tick()  # opens BTC 5m UP
+    engine.provider._price = 0.55  # +10% -> TP win
+    engine.tick(allow_entries=False)
+    assert learner.samples("BTC", "5m", "UP") == 1
+    assert learner.winrate("BTC", "5m", "UP") > 0.5  # a win nudges it up
