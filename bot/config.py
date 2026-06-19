@@ -58,6 +58,12 @@ class Settings:
     #: Which market durations to trade.
     timeframes: tuple[str, ...] = ("5m", "15m")
 
+    # --- Signal -----------------------------------------------------------
+    #: Minimum absolute spot momentum (% change) required to take a side.
+    momentum_threshold_pct: float = 0.03
+    #: Skip markets whose implied spread (1 - up - down) exceeds this.
+    max_spread: float = 0.06
+
     # --- Data feed --------------------------------------------------------
     #: Hosts must be reachable (allowlisted) for live data. If unreachable
     #: the engine automatically falls back to the simulated feed.

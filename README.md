@@ -24,13 +24,30 @@ the market question and slug (e.g. `Bitcoin Up or Down — 5 minute`).
   price reaches the take-profit level.
 - **Optional stop-loss** — default `stop_loss_price = entry_price × 0.90`
   (−10%). Can be toggled off entirely.
-- **Dashboard** showing, per open position: entry price, current mark price,
-  take-profit price, stop-loss price, unrealized PnL, and exit reason labels.
-- **Closed-trades table** showing entry time, close time, entry price, close
-  price, profit %, and exit reason
-  (`TAKE_PROFIT_10_PERCENT` / `STOP_LOSS_10_PERCENT`).
-- **Sidebar settings** — Take Profit % (default 10) and Stop Loss % (default 10),
-  plus position sizing, entry band, and trading mode.
+- **Momentum signal** — direction (UP/DOWN) is chosen from short-term spot
+  momentum (BTC/ETH price from Binance, falling back to Coinbase, then a
+  simulated feed), with a confidence score and a written reason per market.
+- **Auto-refreshing dashboard** (every 10–15 s) with the last scan time.
+
+## Dashboard sections
+
+1. **Live Prices** — BTC/ETH spot price, momentum, price source, last updated,
+   API status.
+2. **Opportunity Scanner** — market title, asset, timeframe, expiry, UP/DOWN
+   prices, spread, signal direction, confidence, and reason to trade / not trade.
+3. **Open Positions** — market, side, entry price, current mark price,
+   take-profit, stop-loss, unrealized PnL, time left, status.
+4. **Closed Trades** — market, side, entry/exit price, profit %, PnL, result
+   (WIN/LOSS), exit reason, close time.
+5. **Performance** — total trades, wins, losses, win rate, net PnL, ROI,
+   average win, average loss, profit factor, max drawdown.
+6. **Daily Stats** — trades today, win rate today, PnL today.
+7. **Debug Panel** — Polymarket API status, Binance/Coinbase API status,
+   markets returned, markets accepted, and skipped trades with reasons.
+
+**Sidebar settings** — Take Profit % (default 10), Stop Loss % (default 10),
+assets, timeframes, momentum threshold, order size, max positions, trading
+mode, and the auto-refresh interval.
 
 ## Quick start
 
@@ -52,15 +69,17 @@ python run_bot.py --all-markets
 
 ## Live data
 
-Live mode reads from Polymarket's public APIs:
+Live mode reads from these public APIs:
 
 - Market discovery: `https://gamma-api.polymarket.com`
 - Live mid prices: `https://clob.polymarket.com`
+- Spot prices (signal): `https://api.binance.com` → `https://api.coinbase.com`
 
-If those hosts are unreachable (e.g. blocked by a network egress allowlist),
-the bot automatically falls back to a **simulated price feed** so the dashboard
-and paper loop keep working. To use live data, allowlist both hosts in your
-environment's network egress settings.
+If any host is unreachable (e.g. blocked by a network egress allowlist), the
+bot automatically falls back to a **simulated feed** for that source so the
+dashboard and paper loop keep working. To use fully live data, allowlist the
+hosts above in your environment's network egress settings. The Debug Panel
+shows exactly which sources are live vs. simulated.
 
 ## Exit logic
 
@@ -94,5 +113,6 @@ pip install pytest
 pytest -q
 ```
 
-Covers the take-profit / stop-loss price formulas, PnL math, exit triggering,
-and the safety guarantees around real orders.
+Covers the universe filter, the momentum signal/scanner, take-profit /
+stop-loss price formulas, PnL and performance math, exit triggering, scan
+diagnostics, and the safety guarantees around real orders.

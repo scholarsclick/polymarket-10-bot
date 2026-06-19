@@ -4,6 +4,10 @@
 APIs (Gamma for market discovery, CLOB for live mid prices). When those hosts
 are not reachable — e.g. blocked by a network egress allowlist — the engine
 falls back to ``SimulatedProvider`` so the dashboard keeps working offline.
+
+Markets are modelled as binary UP/DOWN crypto markets: each ``MarketQuote``
+carries both the UP and DOWN prices/token ids, the underlying asset, the
+timeframe, and the expiry time.
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ import json
 import random
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -32,40 +37,88 @@ TIMEFRAME_PATTERNS = {
     "1d": (r"\b1\s*-?\s*d(?:ay)?s?\b", r"\bdaily\b"),
 }
 
+TIMEFRAME_MINUTES = {"5m": 5, "15m": 15, "1h": 60, "1d": 1440}
+
+# Map an asset to the symbol used by spot exchanges (Binance/Coinbase).
+ASSET_SPOT_SYMBOL = {"BTC": "BTC", "ETH": "ETH", "SOL": "SOL", "XRP": "XRP"}
+
+
+def classify_asset(text: str) -> str | None:
+    blob = (text or "").lower()
+    for asset, patterns in ASSET_KEYWORDS.items():
+        if any(re.search(p, blob) for p in patterns):
+            return asset
+    return None
+
+
+def classify_timeframe(text: str) -> str | None:
+    blob = (text or "").lower()
+    # Check 15m before 5m is unnecessary thanks to word boundaries, but keep a
+    # deterministic order anyway.
+    for tf in ("5m", "15m", "1h", "1d"):
+        if any(re.search(p, blob) for p in TIMEFRAME_PATTERNS[tf]):
+            return tf
+    return None
+
 
 def matches_universe(text: str, assets, timeframes) -> bool:
     """True if ``text`` (question/slug) names one of the assets AND timeframes."""
-    blob = (text or "").lower()
-    asset_ok = any(
-        re.search(p, blob)
-        for a in assets
-        for p in ASSET_KEYWORDS.get(a.upper(), ())
-    )
-    if not asset_ok:
+    asset = classify_asset(text)
+    if asset is None or asset not in {a.upper() for a in assets}:
         return False
-    tf_ok = any(
-        re.search(p, blob)
-        for t in timeframes
-        for p in TIMEFRAME_PATTERNS.get(t.lower(), ())
-    )
-    return tf_ok
+    tf = classify_timeframe(text)
+    return tf is not None and tf in {t.lower() for t in timeframes}
 
 
 @dataclass
 class MarketQuote:
-    """A tradable outcome with its current price."""
+    """A binary UP/DOWN crypto market with both sides priced."""
 
     market_id: str
-    token_id: str
+    token_id: str          # UP token id (primary side, kept for back-compat)
     question: str
-    outcome: str
-    price: float
+    outcome: str           # primary outcome label (UP)
+    price: float           # UP price (kept for back-compat)
     slug: str = ""
+    up_price: float = 0.0
+    down_price: float = 0.0
+    up_token_id: str = ""
+    down_token_id: str = ""
+    asset: str = ""
+    timeframe: str = ""
+    expiry: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.up_token_id:
+            self.up_token_id = self.token_id
+        if self.up_price == 0.0:
+            self.up_price = self.price
+        if self.down_price == 0.0:
+            # Binary market: down ≈ 1 - up.
+            self.down_price = round(max(0.0, 1.0 - self.up_price), 4)
+        if not self.asset:
+            self.asset = classify_asset(self.search_text) or ""
+        if not self.timeframe:
+            self.timeframe = classify_timeframe(self.search_text) or ""
 
     @property
     def search_text(self) -> str:
         """Combined text used for asset/timeframe matching."""
         return f"{self.question} {self.slug}"
+
+    @property
+    def spread(self) -> float:
+        """Bid/ask-style spread proxy: 1 - (up + down). 0 = perfectly priced."""
+        return round(1.0 - (self.up_price + self.down_price), 4)
+
+    def price_for(self, side: str) -> float:
+        return self.up_price if side.upper() == "UP" else self.down_price
+
+    def token_for(self, side: str) -> str:
+        return self.up_token_id if side.upper() == "UP" else self.down_token_id
+
+    def expiry_str(self) -> str:
+        return self.expiry.strftime("%Y-%m-%d %H:%M:%S") if self.expiry else "—"
 
 
 class MarketDataError(RuntimeError):
@@ -87,7 +140,7 @@ class LivePolymarketProvider:
         return "Live Polymarket"
 
     def list_markets(self, limit: int) -> list[MarketQuote]:
-        """Return currently active, tradable outcomes."""
+        """Return currently active, tradable binary markets."""
         url = f"{self.gamma_api_url}/markets"
         params = {
             "active": "true",
@@ -103,29 +156,42 @@ class LivePolymarketProvider:
             )
         quotes: list[MarketQuote] = []
         for m in resp.json():
-            try:
-                token_ids = _maybe_json(m.get("clobTokenIds"))
-                outcomes = _maybe_json(m.get("outcomes"))
-                prices = _maybe_json(m.get("outcomePrices"))
-                if not token_ids or not outcomes:
-                    continue
-                # Use the first outcome (typically "Yes") as the tradable token.
-                price = float(prices[0]) if prices else 0.0
-                quotes.append(
-                    MarketQuote(
-                        market_id=str(m.get("id")),
-                        token_id=str(token_ids[0]),
-                        question=str(m.get("question", "")),
-                        outcome=str(outcomes[0]),
-                        price=price,
-                        slug=str(m.get("slug", "")),
-                    )
-                )
-            except (ValueError, IndexError, TypeError):
-                continue
+            quote = self._parse_market(m)
+            if quote is not None:
+                quotes.append(quote)
         if not quotes:
             raise MarketDataError("Gamma API returned no tradable markets.")
         return quotes
+
+    def _parse_market(self, m: dict) -> MarketQuote | None:
+        try:
+            token_ids = _maybe_json(m.get("clobTokenIds")) or []
+            outcomes = _maybe_json(m.get("outcomes")) or []
+            prices = _maybe_json(m.get("outcomePrices")) or []
+            if len(token_ids) < 2 or len(outcomes) < 2 or len(prices) < 2:
+                return None
+            # Identify which index is the UP/YES side.
+            up_idx = 0
+            for i, o in enumerate(outcomes):
+                if str(o).strip().lower() in {"up", "yes"}:
+                    up_idx = i
+                    break
+            down_idx = 1 - up_idx if len(outcomes) == 2 else (up_idx + 1) % len(outcomes)
+            return MarketQuote(
+                market_id=str(m.get("id")),
+                token_id=str(token_ids[up_idx]),
+                question=str(m.get("question", "")),
+                outcome=str(outcomes[up_idx]),
+                price=float(prices[up_idx]),
+                slug=str(m.get("slug", "")),
+                up_price=float(prices[up_idx]),
+                down_price=float(prices[down_idx]),
+                up_token_id=str(token_ids[up_idx]),
+                down_token_id=str(token_ids[down_idx]),
+                expiry=_parse_dt(m.get("endDate") or m.get("end_date_iso")),
+            )
+        except (ValueError, IndexError, TypeError):
+            return None
 
     def get_price(self, token_id: str) -> float:
         """Return the live mid price for a CLOB token id."""
@@ -146,7 +212,7 @@ class SimulatedProvider:
     network access.
     """
 
-    def __init__(self, seed: int | None = None, drift: float = 0.004, vol: float = 0.012):
+    def __init__(self, seed: int | None = None, drift: float = 0.0, vol: float = 0.02):
         self._rng = random.Random(seed)
         self._drift = drift
         self._vol = vol
@@ -158,29 +224,36 @@ class SimulatedProvider:
         return "Simulated (offline)"
 
     def _build_catalog(self) -> list[MarketQuote]:
-        # Mirrors Polymarket's short-duration crypto up/down markets.
+        now = datetime.now(timezone.utc)
+        # (question, slug, up_price, timeframe)
         seeds = [
-            ("Bitcoin Up or Down — 5 minute", "bitcoin-up-or-down-5m", "Up", 0.51),
-            ("Bitcoin Up or Down — 15 minute", "bitcoin-up-or-down-15m", "Up", 0.48),
-            ("Ethereum Up or Down — 5 minute", "ethereum-up-or-down-5m", "Up", 0.53),
-            ("Ethereum Up or Down — 15 minute", "ethereum-up-or-down-15m", "Up", 0.46),
-            ("Bitcoin Up or Down — 5 minute (next)", "bitcoin-up-or-down-5m-2", "Up", 0.55),
-            ("Ethereum Up or Down — 15 minute (next)", "ethereum-up-or-down-15m-2", "Up", 0.44),
-            ("Bitcoin Up or Down — 15 minute (next)", "bitcoin-up-or-down-15m-2", "Up", 0.49),
-            ("Ethereum Up or Down — 5 minute (next)", "ethereum-up-or-down-5m-2", "Up", 0.5),
+            ("Bitcoin Up or Down — 5 minute", "bitcoin-up-or-down-5m", 0.51, "5m"),
+            ("Bitcoin Up or Down — 15 minute", "bitcoin-up-or-down-15m", 0.48, "15m"),
+            ("Ethereum Up or Down — 5 minute", "ethereum-up-or-down-5m", 0.53, "5m"),
+            ("Ethereum Up or Down — 15 minute", "ethereum-up-or-down-15m", 0.46, "15m"),
+            ("Bitcoin Up or Down — 5 minute (next)", "bitcoin-up-or-down-5m-2", 0.55, "5m"),
+            ("Ethereum Up or Down — 15 minute (next)", "ethereum-up-or-down-15m-2", 0.44, "15m"),
+            ("Bitcoin Up or Down — 15 minute (next)", "bitcoin-up-or-down-15m-2", 0.49, "15m"),
+            ("Ethereum Up or Down — 5 minute (next)", "ethereum-up-or-down-5m-2", 0.50, "5m"),
         ]
         catalog = []
-        for i, (q, slug, outcome, p) in enumerate(seeds):
-            tid = f"sim-token-{i}"
-            self._prices[tid] = p
+        for i, (q, slug, up, tf) in enumerate(seeds):
+            up_tid, down_tid = f"sim-{i}-up", f"sim-{i}-down"
+            self._prices[up_tid] = up
+            self._prices[down_tid] = round(1.0 - up, 4)
             catalog.append(
                 MarketQuote(
                     market_id=f"sim-{i}",
-                    token_id=tid,
+                    token_id=up_tid,
                     question=q,
-                    outcome=outcome,
-                    price=p,
+                    outcome="Up",
+                    price=up,
                     slug=slug,
+                    up_price=up,
+                    down_price=round(1.0 - up, 4),
+                    up_token_id=up_tid,
+                    down_token_id=down_tid,
+                    expiry=now + timedelta(minutes=TIMEFRAME_MINUTES[tf]),
                 )
             )
         return catalog
@@ -190,8 +263,17 @@ class SimulatedProvider:
         for q in self._catalog[:limit]:
             out.append(
                 MarketQuote(
-                    q.market_id, q.token_id, q.question, q.outcome,
-                    self._prices[q.token_id], slug=q.slug,
+                    market_id=q.market_id,
+                    token_id=q.up_token_id,
+                    question=q.question,
+                    outcome="Up",
+                    price=self._prices[q.up_token_id],
+                    slug=q.slug,
+                    up_price=self._prices[q.up_token_id],
+                    down_price=self._prices[q.down_token_id],
+                    up_token_id=q.up_token_id,
+                    down_token_id=q.down_token_id,
+                    expiry=q.expiry,
                 )
             )
         return out
@@ -200,10 +282,13 @@ class SimulatedProvider:
         cur = self._prices.get(token_id)
         if cur is None:
             cur = self._rng.uniform(0.3, 0.7)
-        # Mean-reverting-ish random walk kept inside (0.01, 0.99).
         step = self._drift + self._rng.gauss(0.0, self._vol)
         nxt = min(0.99, max(0.01, cur + step))
         self._prices[token_id] = nxt
+        # Keep the paired side roughly complementary so spreads stay realistic.
+        for tid in self._prices:
+            if tid != token_id and tid.rsplit("-", 1)[0] == token_id.rsplit("-", 1)[0]:
+                self._prices[tid] = round(1.0 - nxt, 4)
         return round(nxt, 4)
 
 
@@ -219,6 +304,15 @@ def _maybe_json(value):
         except json.JSONDecodeError:
             return None
     return None
+
+
+def _parse_dt(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
 
 
 def build_provider(settings, force_simulated: bool = False):
